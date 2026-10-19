@@ -2,5 +2,5 @@ torch
 numpy
 scipy
 pandas
-matplotlib
-cr3bp @ git+https://github.com/nbelakovski/cr3bp
+# cr3bp (github.com/nbelakovski/cr3bp) needs numpy at build time, so install it with
+#   pip install --no-build-isolation "git+https://github.com/nbelakovski/cr3bp"

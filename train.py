@@ -65,6 +65,21 @@ W_IC = 10.0
 W_DATA = 10.0
 W_ACCEL = 5.0
 W_VEL = 5.0
+PHASE_ONE_WEIGHTING = "fixed" # "fixed": the W_* above; "gradnorm": Wang et
+                              # al. (2023) gradient-norm balancing of the
+                              # active terms, weights starting at 1
+GRADNORM_EVERY = 1000         # their published defaults
+GRADNORM_ALPHA = 0.9
+FEATURES = "fourier"          # net input: "fourier" [t, sin kt, cos kt], k = 1..K,
+                              # which repeats exactly over the 2pi arc;
+                              # "fourier_half" frequencies k/2, k = 1..2K (same top
+                              # frequency, repeats every 4pi); "chebyshev"
+                              # T_1..T_2K+1 of s = t/pi - 1 (no periodicity,
+                              # finer resolution near the arc ends)
+W_JERK = 0.0                  # >0: penalty on the net's jerk (third derivative of
+                              # x, y; second of vx, vy), weighted relative to the
+                              # data loss; suppresses wiggles above ~W_JERK**(-1/6)
+                              # rad per time unit
 GRAD_CLIP_NORM = 5.0
 DISPLAY_EVERY = 2000
 MU_LOG_EVERY = 50
@@ -176,11 +191,34 @@ def fourier_features(t, num_frequencies=6):
     return torch.cat([t, torch.sin(angles), torch.cos(angles)], dim=1)
 
 
+def input_features(t, num_frequencies, kind):
+    """Network input expansion selected by FEATURES (see the constant)."""
+    if kind == "fourier":
+        return fourier_features(t, num_frequencies)
+    if kind == "fourier_half":
+        freqs = torch.arange(1, 2 * num_frequencies + 1, device=t.device, dtype=t.dtype) / 2
+        return torch.cat([t, torch.sin(t * freqs), torch.cos(t * freqs)], dim=1)
+    if kind == "chebyshev":
+        # recurrence, not cos(k*acos(s)): acos has an infinite slope at s = +-1
+        s = t / np.pi - 1
+        T = [torch.ones_like(s), s]
+        for _ in range(2 * num_frequencies):
+            T.append(2 * s * T[-1] - T[-2])
+        return torch.cat(T[1:], dim=1)
+    raise ValueError(f"unknown FEATURES {kind!r}")
+
+
+def feature_dim(num_frequencies, kind):
+    return {"fourier": 1 + 2 * num_frequencies, "fourier_half": 1 + 4 * num_frequencies,
+            "chebyshev": 1 + 2 * num_frequencies}[kind]
+
+
 class FNN(nn.Module):
     def __init__(self, num_frequencies=6, layer_sizes=(128, 128, 128, 128, 4)):
         super().__init__()
         self.num_frequencies = num_frequencies
-        input_dim = 1 + 2 * num_frequencies
+        self.features = FEATURES
+        input_dim = feature_dim(num_frequencies, self.features)
         full_sizes = (input_dim,) + layer_sizes
 
         layers = []
@@ -197,7 +235,7 @@ class FNN(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, t):
-        t_expanded = fourier_features(t, self.num_frequencies)
+        t_expanded = input_features(t, self.num_frequencies, self.features)
         return self.net(t_expanded)
 
 
@@ -351,6 +389,16 @@ def build_phaseone_loss(net, t, x, y, vx, vy, noise_sigma=0.0):
         # the untouched component tensors, for callers that rebalance w
         compute_loss.parts = dict(ic=ic_loss, data=data_loss,
                                   accel=accel_loss, vel=vel_loss)
+        if W_JERK > 0:
+            # finite differences of the outputs on the (uniform) sample grid,
+            # so no extra autograd level; tied to the data weight
+            jerk_loss = 0.0
+            for p, v in ((pred[:, 0], pred[:, 2]), (pred[:, 1], pred[:, 3])):
+                d3p = (p[3:] - 3 * p[2:-1] + 3 * p[1:-2] - p[:-3]) / dt ** 3
+                d2v = (v[2:] - 2 * v[1:-1] + v[:-2]) / dt ** 2
+                jerk_loss = jerk_loss + 0.5 * (torch.mean(d3p ** 2) + torch.mean(d2v ** 2))
+            total = total + w["data"] * W_JERK * jerk_loss
+            compute_loss.parts["jerk"] = jerk_loss
         return total, ic_loss.item(), data_loss.item(), accel_loss.item(), vel_loss.item()
 
     compute_loss.weights = dict(ic=w_ic, data=W_DATA, accel=W_ACCEL, vel=W_VEL)
@@ -394,6 +442,15 @@ def train_phaseone(t, x, y, vx, vy, traj_idx, noise_sigma=0.0):
     vel_gate = gates["vel"] if gates["vel"] is not None else float("inf")
     data_gate = gates["data"]
 
+    w = compute_loss.weights
+    gradnorm = PHASE_ONE_WEIGHTING == "gradnorm"
+    if gradnorm:
+        # only active terms: ic is off under noise, accel is zero with no target
+        active = [k for k in w if w[k] > 0 and not (k == "accel" and ACCEL_TARGET == "none")]
+        for k in w:
+            w[k] = 1.0 if k in active else 0.0
+        history = []
+
     it = 0
     data_l = float("inf")
     accel_l = float("inf")
@@ -404,6 +461,8 @@ def train_phaseone(t, x, y, vx, vy, traj_idx, noise_sigma=0.0):
            or vel_l > vel_gate) and it < PHASE_ONE_ITERS:
         optimizer.zero_grad()
         loss, ic_l, data_l, accel_l, vel_l = compute_loss()
+        if gradnorm and it % GRADNORM_EVERY == 0:
+            loss = gradnorm_update(compute_loss, params, active, it, history)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(params, GRAD_CLIP_NORM)
         optimizer.step()
@@ -412,7 +471,8 @@ def train_phaseone(t, x, y, vx, vy, traj_idx, noise_sigma=0.0):
         if it % DISPLAY_EVERY == 0:
             print(f"  [traj {traj_idx}] phase1 it={it:6d} loss={loss.item():.4e} "
                   f"ic={ic_l:.2e} data={data_l:.2e} accel={accel_l:.2e} vel={vel_l:.2e} "
-                  f"lr={scheduler.get_last_lr()[0]:.2e}")
+                  f"lr={scheduler.get_last_lr()[0]:.2e}"
+                  + ("".join(f" w_{k}={w[k]:.3g}" for k in active) if gradnorm else ""))
 
     elapsed = time.time() - t_start_time
     print(f"  [traj {traj_idx}] phase one Adam done in {elapsed:.1f}s, iters={it}, "
@@ -420,11 +480,40 @@ def train_phaseone(t, x, y, vx, vy, traj_idx, noise_sigma=0.0):
           f"vel_l={vel_l:.4e} (gate {vel_gate:.1e}), rms|a|={a_scale ** 0.5:.3g}")
 
     hit_cap = it >= PHASE_ONE_ITERS
+    # L-BFGS keeps the weights reached at hand-over
     if PHASE_ONE_LBFGS_ITERS > 0:
         data_l, accel_l, vel_l, _ = lbfgs_phaseone(net, compute_loss, PHASE_ONE_LBFGS_ITERS, traj_idx)
     if SAVE_NETS:
         torch.save(net.state_dict(), f"net_traj{traj_idx}.pt")
+    if gradnorm:
+        with open(f"weights_traj{traj_idx}.csv", "w", newline="") as f:
+            cw = csv.writer(f)
+            cw.writerow(["iter"] + [f"loss_{k}" for k in active]
+                        + [f"gradnorm_{k}" for k in active] + [f"w_{k}" for k in active])
+            cw.writerows(history)
+    train_phaseone.weights = dict(w)          # final weights, for callers to record
     return net, data_l, accel_l, vel_l, it, hit_cap
+
+
+def gradnorm_update(compute_loss, params, active, it, history):
+    """One Wang et al. (2023) step: w_i <- a*w_i + (1-a)*sum_j|g_j| / |g_i|,
+    with |g_i| the L2 norm of grad L_i over all parameters. Returns the
+    loss re-weighted with the new values."""
+    w, parts = compute_loss.weights, compute_loss.parts
+    norms = {}
+    for k in active:
+        grads = torch.autograd.grad(parts[k], params, retain_graph=True, allow_unused=True)
+        norms[k] = float(torch.sqrt(sum((g ** 2).sum() for g in grads if g is not None)))
+    total = sum(norms.values())
+    for k in active:
+        if norms[k] > 0:
+            w[k] = GRADNORM_ALPHA * w[k] + (1 - GRADNORM_ALPHA) * total / norms[k]
+    history.append([it] + [parts[k].item() for k in active]
+                   + [norms[k] for k in active] + [w[k] for k in active])
+    loss = sum(w[k] * parts[k] for k in active)
+    if "jerk" in parts:
+        loss = loss + w["data"] * W_JERK * parts["jerk"]
+    return loss
 
 
 # ---------------------------------------------------------------------------

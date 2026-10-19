@@ -29,6 +29,14 @@ dynamics are never integrated. These differ only in the smoother:
                                represent mu < 0.001, and no
                                position-only mode at all.
 
+WEAK FORM AND JACOBI CONSTANT: no second derivative of the data.
+
+    estimate_mu_weak()         equations integrated against bump test
+                               functions, derivatives moved onto the
+                               bumps (Weak SINDy, Messenger & Bortz 2021).
+    estimate_mu_jacobi()       flattest Jacobi constant along a curve;
+    estimate_mu_jacobi_savgol() the same on Savitzky-Golay states.
+
 ORBIT DETERMINATION: integrate the dynamics and fit, never
 differentiating the measurements. Batch least squares and sequential
 filtering are the two established methods in this field (Tapley, Born &
@@ -688,6 +696,96 @@ def estimate_mu_tvdiff(t, x, y, vx, vy, use_velocity=True,
 
 
 # ---------------------------------------------------------------------------
+# Weak form and Jacobi constant: read-outs that never take a second
+# derivative of the data
+# ---------------------------------------------------------------------------
+SCAN_GRID = np.logspace(-7, np.log10(0.5), 400)
+
+
+def effective_force(x, y, mu):
+    """Gravity + centrifugal part of the CR3BP acceleration (no Coriolis)."""
+    xp, xm = x + mu, x - 1 + mu
+    i1, i2 = (xp**2 + y**2) ** -1.5, (xm**2 + y**2) ** -1.5
+    return x - (1 - mu) * xp * i1 - mu * xm * i2, y - (1 - mu) * y * i1 - mu * y * i2
+
+
+def jacobi_constant(x, y, vx, vy, mu):
+    xp, xm = x + mu, x - 1 + mu
+    return (x**2 + y**2 + 2 * (1 - mu) / np.sqrt(xp**2 + y**2)
+            + 2 * mu / np.sqrt(xm**2 + y**2) - vx**2 - vy**2)
+
+
+def fit_mu_scan(obj):
+    """Log-mu scan of obj (vectorised over a column of mu values), then
+    bounded refinement inside the winning cell. Returns (mu, contrast)."""
+    v = obj(SCAN_GRID[:, None])
+    k = int(np.argmin(v))
+    lo = np.log10(SCAN_GRID[max(k - 1, 0)])
+    hi = np.log10(SCAN_GRID[min(k + 1, len(SCAN_GRID) - 1)])
+    r = minimize_scalar(lambda lm: obj(np.array([[10.0**lm]]))[0], bounds=(lo, hi),
+                        method="bounded", options={"xatol": 1e-12})
+    return 10.0**r.x, float(v.max() / v.min())
+
+
+def weak_test_functions(t, a):
+    """Bumps (1 - s^2)^4 of half-width a every a/2, with their first and second
+    time derivatives, premultiplied by trapezoid weights (uniform t)."""
+    w = np.full(len(t), t[1] - t[0])
+    w[[0, -1]] /= 2
+    cs = np.arange(t[0] + a, t[-1] - a + 1e-12, a / 2)
+    s = (t[None, :] - cs[:, None]) / a
+    q = np.where(np.abs(s) < 1, 1 - s**2, 0.0)
+    phi = q**4
+    dphi = -8 * s / a * q**3
+    ddphi = (-8 * q**3 + 48 * s**2 * q**2) / a**2
+    return phi * w, dphi * w, ddphi * w
+
+
+def weak_objective(t, x, y, a):
+    """Sum of squared weak residuals: int(phi'' x) + 2 int(phi' y) - int(phi Omega_x),
+    and the y counterpart, over all bumps."""
+    P, P1, P2 = weak_test_functions(t, a)
+    Ax, Ay = P2 @ x + 2 * P1 @ y, P2 @ y - 2 * P1 @ x
+
+    def obj(mu):
+        ox, oy = effective_force(x[None, :], y[None, :], mu)
+        return ((Ax[:, None] - P @ ox.T) ** 2).sum(0) + ((Ay[:, None] - P @ oy.T) ** 2).sum(0)
+    return obj
+
+
+def estimate_mu_weak(t, x, y, vx=None, vy=None, use_velocity=False, half_width=0.4):
+    """Weak form on the samples (Weak SINDy's form, Messenger & Bortz 2021):
+    each equation of motion is multiplied by a bump and integrated over its
+    window; integration by parts moves both time derivatives onto the bump,
+    so only positions enter and the data are never differentiated. Velocities
+    are ignored in either mode."""
+    t0 = time.time()
+    t, x, y = (np.asarray(a, dtype=float).flatten() for a in (t, x, y))
+    mu, contrast = fit_mu_scan(weak_objective(t, x, y, half_width))
+    return dict(mu_pred=float(mu), contrast=contrast, half_width=half_width,
+                elapsed_s=time.time() - t0)
+
+
+def estimate_mu_jacobi(x, y, vx, vy):
+    """mu that makes the Jacobi constant flattest (least variance) along a
+    curve with the given positions and velocities. One derivative instead of
+    two, but it checks only the force along the motion."""
+    t0 = time.time()
+    x, y, vx, vy = (np.asarray(a, dtype=float).flatten() for a in (x, y, vx, vy))
+    mu, contrast = fit_mu_scan(lambda m: jacobi_constant(x, y, vx, vy, m).var(axis=-1))
+    return dict(mu_pred=float(mu), contrast=contrast, elapsed_s=time.time() - t0)
+
+
+def estimate_mu_jacobi_savgol(t, x, y, window, polyorder):
+    """Jacobi fit on Savitzky-Golay positions and velocities of the samples,
+    with the window and order estimate_mu_savgol chose on the same data."""
+    t, x, y = (np.asarray(a, dtype=float).flatten() for a in (t, x, y))
+    sx, svx, sy, svy = (savgol_filter(u, window, polyorder, deriv=d, delta=t[1] - t[0])
+                        for u in (x, y) for d in (0, 1))
+    return estimate_mu_jacobi(sx, sy, svx, svy)
+
+
+# ---------------------------------------------------------------------------
 # Batch least squares (initial state + mu estimated jointly)
 # ---------------------------------------------------------------------------
 def _bls_residual(params, t, x, y, vx, vy, use_velocity, tol):
@@ -709,7 +807,8 @@ def _bls_residual(params, t, x, y, vx, vy, use_velocity, tol):
 
 def estimate_mu_bls(t, x, y, vx, vy, use_velocity=True,
                     mu_bounds=DEFAULT_MU_BOUNDS, n_coarse=25,
-                    max_nfev=400, tol=None, verbose=False):
+                    max_nfev=400, tol=None, verbose=False,
+                    restart_log_mu=(), restart_above=np.inf):
     """
     Recover mu by batch least squares: the classical orbit-determination
     baseline. Five parameters (x0, y0, vx0, vy0, log10 mu) are fitted to
@@ -726,10 +825,17 @@ def estimate_mu_bls(t, x, y, vx, vy, use_velocity=True,
     probing candidate mu that dive into a primary); `success` and `nfev`
     record whether that bound was reached.
 
+    Multi-start: if the first fit's cost exceeds restart_above, the fit is
+    repeated from each log10(mu) in restart_log_mu (same initial state) and
+    the lowest-cost fit is kept. A fit that explains the data down to the
+    noise has cost ~ (number of residuals) * sigma^2 / 2, so a cost far above
+    that flags a failed fit without the truth. The defaults give the single
+    start used through run18.
+
     Returns
     -------
     dict with mu_pred, state0, success, cost, nfev, coarse_log_mu0,
-    elapsed_s.
+    start_log_mu, n_fits, mu_first, cost_first, elapsed_s.
     """
     tol = tol or INTEGRATOR_TOL
     t = np.asarray(t, dtype=float).flatten()
@@ -756,18 +862,30 @@ def estimate_mu_bls(t, x, y, vx, vy, use_velocity=True,
     ])
     log_mu0 = float(coarse_grid[int(coarse_costs.argmin())])
 
-    p0 = np.append(state0, log_mu0)
     lo = np.array([-np.inf, -np.inf, -np.inf, -np.inf, log_lo])
     hi = np.array([np.inf, np.inf, np.inf, np.inf, log_hi])
-    result = least_squares(_bls_residual, p0, bounds=(lo, hi),
-                           x_scale="jac", max_nfev=max_nfev,
-                           args=(t, x, y, vx, vy, use_velocity, tol),
-                           verbose=2 if verbose else 0)
+
+    def fit(lm0):
+        return least_squares(_bls_residual, np.append(state0, lm0), bounds=(lo, hi),
+                             x_scale="jac", max_nfev=max_nfev,
+                             args=(t, x, y, vx, vy, use_velocity, tol),
+                             verbose=2 if verbose else 0)
+
+    first = result = fit(log_mu0)
+    start, n_fits = log_mu0, 1
+    if first.cost > restart_above:
+        for lm0 in restart_log_mu:
+            r = fit(lm0)
+            n_fits += 1
+            if r.cost < result.cost:
+                result, start = r, float(lm0)
 
     mu_pred = float(10.0 ** result.x[4])
     return dict(mu_pred=mu_pred, state0=result.x[:4].copy(),
                 success=bool(result.success), cost=float(result.cost),
                 nfev=int(result.nfev), coarse_log_mu0=log_mu0,
+                start_log_mu=start, n_fits=n_fits,
+                mu_first=float(10.0 ** first.x[4]), cost_first=float(first.cost),
                 elapsed_s=time.time() - t_start)
 
 
