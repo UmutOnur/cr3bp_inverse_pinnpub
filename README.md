@@ -1,6 +1,7 @@
 # Recovering the CR3BP mass ratio with a PINN
 
-Code and results behind the progress report: 599 of the 1000 orbits so far.
+Code and results on all 999 complete orbits of the 1000 (orbit 938's integration
+stopped early, so it is left out); the progress report used the first 599.
 Every method uses 1000 noisy position samples per orbit (σ = 10⁻³).
 
 ## Files

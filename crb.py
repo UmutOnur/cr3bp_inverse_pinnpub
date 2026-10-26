@@ -3,7 +3,7 @@ deviation any unbiased estimator can reach from n = 1000 position samples with
 noise sigma = 1e-3. Fisher information from the variational equations
 (sensitivities of x, y to x0, y0, vx0, vy0, mu), evaluated at the true values.
 Checked against finite differences on 646 and 821 (agreement 5e-7 or better).
-Run directly for the 599 orbits in results/: writes crb.csv to the current
+Run directly for the 999 orbits in results/: writes crb.csv to the current
 folder (CPU, a few minutes on 7 workers)."""
 import csv
 import time
@@ -60,5 +60,5 @@ if __name__ == "__main__":
     with Pool(7) as p, open("crb.csv", "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["traj_index", "mu_true", "crb_sd_mu", "reint_pos_err", "seconds"])
-        for row in p.imap_unordered(job, [i for i in range(1000) if i % 5 in (0, 1, 3) and i != 938]):
+        for row in p.imap_unordered(job, [i for i in range(1000) if i != 938]):
             w.writerow(row)

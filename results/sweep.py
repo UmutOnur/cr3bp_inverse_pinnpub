@@ -1,5 +1,5 @@
-"""The current model and the network-free methods on the 599 orbits in this
-folder (indices 0, 1 and 3 mod 5, without the truncated 938). Non-spline PINN,
+"""The current model and the network-free methods on the 999 orbits in this
+folder (all 1000 without the truncated 938). Non-spline PINN,
 position-only, gradient-norm weighting, K = 6, 40k Adam cap, L-BFGS 2500.
 n = 1000, sigma = 1e-3, noise seeds 1000*idx + 4; every network-free method
 sees the identical samples.
@@ -73,7 +73,7 @@ CRB_COLS = ["traj_index", "mu_true", "crb_sd_mu", "reint_pos_err", "seconds"]
 def orbits():
     """(index, min_r, group); closest approach >= 0.05 first."""
     idx = ([int(i) for i in os.environ["SWEEP_ORBITS"].split(",")] if "SWEEP_ORBITS" in os.environ
-           else [i for i in range(1000) if i % 5 in (0, 1, 3) and i != 938])
+           else [i for i in range(1000) if i != 938])
     out = []
     for i in idx:
         _, x, y, _, _, mu = train.load_trajectory(DATA, i)
